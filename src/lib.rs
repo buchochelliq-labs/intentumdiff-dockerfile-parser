@@ -3,8 +3,8 @@
 //! Handles `Dockerfile` and `*.dockerfile` files.
 //! Uses tree-sitter-dockerfile directly (no Python grammar package needed).
 
-use intentumdiff_plugin_sdk::ts_convert::{convert_ts_direct, TsDirectHooks};
 use intentumdiff_plugin_sdk::tree::{SemanticNode, SemanticNodeBuilder};
+use intentumdiff_plugin_sdk::ts_convert::{convert_ts_direct, TsDirectHooks};
 
 wit_bindgen::generate!({
     path: "wit/plugin.wit",
@@ -71,6 +71,10 @@ const SEMANTIC_TYPES: &[&str] = &[
     "single_quoted_string",
     "unquoted_string",
     "json_string_array",
+    // Exec-form arguments (CMD/ENTRYPOINT/RUN/SHELL/VOLUME/ADD/COPY ["..."]). Without
+    // this the array projected to no children and an argument edit hashed style-only
+    // (#5).
+    "json_string",
     "path",
     "param",
     "env_pair",
@@ -199,7 +203,35 @@ fn convert_ts(node: tree_sitter::Node<'_>, source: &[u8], id_prefix: &str) -> Op
     )
 }
 
+/// Drop carriage returns that are part of a physical line terminator, as Docker's own
+/// line scanner does (moby/buildkit `scanLines`/`dropCR`): a CR immediately before LF,
+/// or a final CR at end of input. A lone CR anywhere else is content and is kept.
+///
+/// The grammar treats such a CR as command text (`shell_fragment` "echo hello\r") and
+/// does not recognise `\` + CRLF as a line continuation, so an LF -> CRLF conversion
+/// surfaced as a semantic RUN change (#4). Every dropped CR is the last byte of its row,
+/// so the (row, UTF-8 byte column) positions of the parsed copy are exact positions in
+/// the original source; a span merely ends before the terminator instead of inside it.
+fn normalize_line_terminators(source: &str) -> std::borrow::Cow<'_, str> {
+    if !source.contains('\r') {
+        return std::borrow::Cow::Borrowed(source);
+    }
+    let bytes = source.as_bytes();
+    let mut out = String::with_capacity(source.len());
+    let mut start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'\r' && (i + 1 == bytes.len() || bytes[i + 1] == b'\n') {
+            out.push_str(&source[start..i]);
+            start = i + 1;
+        }
+    }
+    out.push_str(&source[start..]);
+    std::borrow::Cow::Owned(out)
+}
+
 fn process_impl(source: &str) -> String {
+    let source = normalize_line_terminators(source);
+    let source: &str = &source;
     let mut parser = tree_sitter::Parser::new();
     let lang = tree_sitter_dockerfile::LANGUAGE.into();
     if parser.set_language(&lang).is_err() {
@@ -318,5 +350,198 @@ mod tests {
     fn process_impl_whitespace_returns_valid_json() {
         let out = process_impl("   \n  ");
         t::assert_valid_json(&out, "process(whitespace)");
+    }
+
+    // -- helpers for the projection regressions --------------------------------------
+
+    fn tree(source: &str) -> serde_json::Value {
+        let out = process_impl(source);
+        t::assert_valid_json(&out, "process");
+        serde_json::from_str(&out).unwrap()
+    }
+
+    /// Pre-order (node_type, label) projection: what host-side hashing and matching see.
+    fn projection(source: &str) -> Vec<(String, String)> {
+        fn walk(v: &serde_json::Value, out: &mut Vec<(String, String)>) {
+            out.push((
+                v["node_type"].as_str().unwrap().to_string(),
+                v["label"].as_str().unwrap().to_string(),
+            ));
+            for c in v["children"].as_array().unwrap() {
+                walk(c, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(&tree(source), &mut out);
+        out
+    }
+
+    fn labels_of(source: &str, node_type: &str) -> Vec<String> {
+        projection(source)
+            .into_iter()
+            .filter(|(k, _)| k == node_type)
+            .map(|(_, l)| l)
+            .collect()
+    }
+
+    // -- #5: exec-form arguments are semantic -----------------------------------------
+
+    const PLAYGROUND_OLD: &str = "FROM node:18-alpine AS builder\nWORKDIR /app\nCOPY package.json ./\nRUN npm install --omit=dev\nENV APP_PORT=8080\nENV LOG_LEVEL=info\nEXPOSE 9091\nLABEL maintainer=\"platform-team\"\nHEALTHCHECK CMD curl --fail http://localhost:9091/health\nUSER svc_runner\nCMD [\"dist/index.js\"]\n";
+    const PLAYGROUND_NEW: &str = "FROM node:18-alpine AS builder\nWORKDIR /app\nCOPY package.json ./\nRUN npm install --omit=dev\nENV APP_PORT=8080\nENV LOG_LEVEL=info\nEXPOSE 9091\nLABEL maintainer=\"platform-team\"\nHEALTHCHECK CMD curl --fail http://localhost:9091/health\nUSER svc_runner\nCMD [\"dist/worker.js\"]\n";
+
+    #[test]
+    fn exec_form_cmd_argument_change_is_projected() {
+        assert_eq!(
+            labels_of(PLAYGROUND_OLD, "json_string"),
+            vec!["\"dist/index.js\"".to_string()]
+        );
+        assert_eq!(
+            labels_of(PLAYGROUND_NEW, "json_string"),
+            vec!["\"dist/worker.js\"".to_string()]
+        );
+        assert_ne!(projection(PLAYGROUND_OLD), projection(PLAYGROUND_NEW));
+    }
+
+    #[test]
+    fn exec_form_keeps_every_argument_in_order() {
+        let src = "CMD [\"node\", \"a \\\"q\\\" b\", \"h\u{e9}llo\u{2603}\"]\n";
+        assert_eq!(
+            labels_of(src, "json_string"),
+            vec![
+                "\"node\"".to_string(),
+                "\"a \\\"q\\\" b\"".to_string(),
+                "\"h\u{e9}llo\u{2603}\"".to_string(),
+            ]
+        );
+        // Argument order is part of argv.
+        assert_ne!(
+            projection("CMD [\"a\", \"b\"]\n"),
+            projection("CMD [\"b\", \"a\"]\n")
+        );
+        // Adding an argument is a change.
+        assert_ne!(
+            projection("CMD [\"a\"]\n"),
+            projection("CMD [\"a\", \"b\"]\n")
+        );
+    }
+
+    #[test]
+    fn exec_form_whitespace_is_not_semantic() {
+        assert_eq!(
+            projection("CMD [\"node\",\"index.js\"]\n"),
+            projection("CMD [ \"node\" ,   \"index.js\" ]\n")
+        );
+    }
+
+    #[test]
+    fn exec_form_entrypoint_and_run_share_the_projection() {
+        for kw in ["ENTRYPOINT", "RUN", "SHELL", "VOLUME"] {
+            let old = format!("{kw} [\"/bin/a\"]\n");
+            let new = format!("{kw} [\"/bin/b\"]\n");
+            assert_eq!(
+                labels_of(&old, "json_string"),
+                vec!["\"/bin/a\"".to_string()],
+                "{kw}"
+            );
+            assert_ne!(projection(&old), projection(&new), "{kw}");
+        }
+    }
+
+    // -- #4: CRLF terminators are layout, not command text ----------------------------
+
+    /// LF and CRLF spellings of the same Dockerfile must produce identical trees
+    /// (labels AND positions: every dropped CR is the last byte of its row).
+    fn assert_crlf_equivalent(lf: &str) {
+        let crlf = lf.replace('\n', "\r\n");
+        assert_eq!(tree(lf), tree(&crlf), "LF vs CRLF tree differs for {lf:?}");
+    }
+
+    #[test]
+    fn crlf_assessment_case_is_layout_only() {
+        let old = "FROM scratch\nRUN echo hello\nCMD [\"/app\"]\n";
+        let new = "FROM scratch\r\nRUN echo hello\r\nCMD [\"/app\"]\r\n";
+        assert_eq!(tree(old), tree(new));
+        assert_eq!(
+            labels_of(new, "shell_fragment"),
+            vec!["echo hello".to_string()]
+        );
+    }
+
+    #[test]
+    fn crlf_issue_reproduction_is_layout_only() {
+        let old = "FROM node:22\nRUN npm install --omit=dev\n";
+        let new = "FROM node:22\r\nRUN npm install --omit=dev\r\n";
+        assert_eq!(tree(old), tree(new));
+    }
+
+    #[test]
+    fn crlf_multiple_runs_continuations_and_instructions() {
+        assert_crlf_equivalent(
+            "FROM scratch\nRUN echo one\nRUN echo two \\\n  && ls -la\nUSER svc\nENV A=b C=\"d\"\nWORKDIR /app\nEXPOSE 80\nLABEL x=y\nARG Q=1\nCOPY a b\nHEALTHCHECK CMD curl x\nENTRYPOINT [\"x\", \"y\"]\n",
+        );
+    }
+
+    #[test]
+    fn crlf_continuation_is_not_swallowed() {
+        // `\` + CRLF must continue the line like `\` + LF does; before the fix the
+        // grammar stopped recognising every instruction after it.
+        let crlf = "FROM scratch\r\nRUN a \\\r\n  b\r\nUSER svc\r\n";
+        assert_eq!(
+            labels_of(crlf, "user_instruction"),
+            vec!["USER svc".to_string()]
+        );
+        assert!(labels_of(crlf, "shell_fragment")
+            .iter()
+            .all(|l| !l.contains('\r')));
+    }
+
+    #[test]
+    fn crlf_mixed_endings_and_final_newline_variants() {
+        let lf = "FROM scratch\nRUN echo hello\nRUN echo bye";
+        assert_eq!(
+            tree(lf),
+            tree("FROM scratch\r\nRUN echo hello\nRUN echo bye")
+        );
+        assert_eq!(
+            tree(lf),
+            tree("FROM scratch\nRUN echo hello\r\nRUN echo bye")
+        );
+        // A trailing CR at end of input is a line terminator (moby dropCR at EOF).
+        assert_eq!(
+            tree(lf),
+            tree("FROM scratch\nRUN echo hello\nRUN echo bye\r")
+        );
+        assert_crlf_equivalent("FROM scratch\nRUN echo hello\n");
+    }
+
+    #[test]
+    fn crlf_real_command_change_stays_semantic() {
+        assert_ne!(
+            projection("FROM scratch\r\nRUN echo hello\r\n"),
+            projection("FROM scratch\r\nRUN echo world\r\n")
+        );
+    }
+
+    #[test]
+    fn lone_cr_is_content_and_kept() {
+        let src = "RUN printf 'a\rb'\n";
+        assert!(labels_of(src, "shell_fragment")
+            .iter()
+            .any(|l| l.contains('\r')));
+        assert_eq!(normalize_line_terminators("a\rb\r\nc\r"), "a\rb\nc");
+        assert!(matches!(
+            normalize_line_terminators("no cr\n"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn crlf_positions_are_original_byte_columns() {
+        let v = tree("FROM scratch\r\nRUN echo h\u{e9}\r\n");
+        let run = &v["children"][1];
+        assert_eq!(run["node_type"], "run_instruction");
+        assert_eq!(run["position"]["start_line"], 1);
+        // "RUN echo hé" is 12 UTF-8 bytes; the span ends before the CR.
+        assert_eq!(run["position"]["end_col"], 12);
     }
 }
